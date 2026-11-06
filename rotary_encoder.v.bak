@@ -1,0 +1,146 @@
+// ================================================================
+// rotary_encoder.v
+// EC11 incremental encoder for FPGA Oscilloscope
+//
+// A/B are synchronized to CLOCK_50.
+// One complete quadrature cycle = one position step.
+// SW produces a one-clock pulse after ~5 ms debounce.
+// ================================================================
+
+module rotary_encoder (
+    input  wire       clk,
+    input  wire       rst_n,
+
+    input  wire       enc_a,
+    input  wire       enc_b,
+    input  wire       enc_sw,
+
+    output reg signed [7:0] position,
+    output reg              button_pulse
+);
+
+    // ------------------------------------------------------------
+    // Synchronize encoder A/B
+    // ------------------------------------------------------------
+    reg a_ff1, a_ff2;
+    reg b_ff1, b_ff2;
+
+    reg [1:0] last_state;
+    reg signed [2:0] step_acc;
+
+    wire [1:0] state_now = {a_ff2, b_ff2};
+
+    always @(posedge clk) begin
+        if (!rst_n) begin
+            a_ff1      <= 1'b1;
+            a_ff2      <= 1'b1;
+            b_ff1      <= 1'b1;
+            b_ff2      <= 1'b1;
+            last_state <= 2'b11;
+            step_acc   <= 3'sd0;
+            position   <= 8'sd0;
+        end
+        else begin
+            a_ff1 <= enc_a;
+            a_ff2 <= a_ff1;
+            b_ff1 <= enc_b;
+            b_ff2 <= b_ff1;
+
+            if (state_now != last_state) begin
+
+                case ({last_state, state_now})
+
+                    // Direction 1:
+                    // 00 -> 01 -> 11 -> 10 -> 00
+                    4'b0001,
+                    4'b0111,
+                    4'b1110,
+                    4'b1000: begin
+
+                        if (step_acc < 3)
+                            step_acc <= step_acc + 1;
+                    end
+
+                    // Direction 2:
+                    // 00 -> 10 -> 11 -> 01 -> 00
+                    4'b0010,
+                    4'b1011,
+                    4'b1101,
+                    4'b0100: begin
+
+                        if (step_acc > -3)
+                            step_acc <= step_acc - 1;
+                    end
+
+                    default: begin
+                        // Ignore invalid/bounce transitions.
+                    end
+
+                endcase
+
+                // Complete cycle.
+                if ((step_acc == 3) &&
+                    (last_state == 2'b10) &&
+                    (state_now == 2'b00)) begin
+
+                    if (position < 8'sd31)
+                        position <= position + 1;
+
+                    step_acc <= 3'sd0;
+                end
+
+                if ((step_acc == -3) &&
+                    (last_state == 2'b01) &&
+                    (state_now == 2'b00)) begin
+
+                    if (position > -8'sd31)
+                        position <= position - 1;
+
+                    step_acc <= 3'sd0;
+                end
+
+                last_state <= state_now;
+            end
+        end
+    end
+
+    // ------------------------------------------------------------
+    // Push button debounce
+    // 50 MHz * 5 ms = 250000 clocks
+    // ------------------------------------------------------------
+    reg sw_ff1;
+    reg sw_ff2;
+    reg sw_stable;
+    reg [18:0] sw_count;
+
+    always @(posedge clk) begin
+        if (!rst_n) begin
+            sw_ff1       <= 1'b1;
+            sw_ff2       <= 1'b1;
+            sw_stable    <= 1'b1;
+            sw_count     <= 19'd0;
+            button_pulse <= 1'b0;
+        end
+        else begin
+            sw_ff1       <= enc_sw;
+            sw_ff2       <= sw_ff1;
+            button_pulse <= 1'b0;
+
+            if (sw_ff2 == sw_stable) begin
+                sw_count <= 19'd0;
+            end
+            else if (sw_count == 19'd249_999) begin
+                sw_stable <= sw_ff2;
+                sw_count  <= 19'd0;
+
+                // Active-low switch: HIGH -> LOW = press.
+                if (sw_ff2 == 1'b0)
+                    button_pulse <= 1'b1;
+            end
+            else begin
+                sw_count <= sw_count + 1'b1;
+            end
+        end
+    end
+
+endmodule

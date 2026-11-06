@@ -1,0 +1,31 @@
+module top (
+    input  wire       CLOCK_50,
+    input  wire       RESET_N,
+
+    output wire       MCP_CS,
+    output wire       MCP_DIN,
+    input  wire       MCP_DOUT,
+    output wire       MCP_CLK,
+
+    output wire [9:0] LED
+);
+
+    wire [9:0] adc_data;
+    wire       adc_valid;
+
+    mcp3008_spi u_adc (
+        .clk       (CLOCK_50),
+        .rst_n     (RESET_N),
+
+        .adc_cs    (MCP_CS),
+        .adc_clk   (MCP_CLK),
+        .adc_din   (MCP_DIN),
+        .adc_dout  (MCP_DOUT),
+
+        .adc_data  (adc_data),
+        .adc_valid (adc_valid)
+    );
+
+    assign LED = adc_data;
+
+endmodule

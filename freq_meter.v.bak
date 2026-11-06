@@ -1,0 +1,108 @@
+module freq_meter #(
+    parameter integer SAMPLE_RATE = 20000
+)(
+    input  wire        clk,
+    input  wire        rst_n,
+    input  wire [9:0]  adc_data,
+    input  wire        adc_valid,
+    input  wire        adc_ch,
+
+    output reg [31:0] freq1_hz,
+    output reg [31:0] freq2_hz,
+    output reg        freq1_valid,
+    output reg        freq2_valid
+);
+
+    // Hysteresis around ~1.65 V for a 0..3.3 V ADC.
+    parameter [9:0] LEVEL_LOW  = 10'd500;
+    parameter [9:0] LEVEL_HIGH = 10'd524;
+
+    // CH1
+    reg        above1;
+    reg        have_edge1;
+    reg [31:0] count1;
+
+    // CH2
+    reg        above2;
+    reg        have_edge2;
+    reg [31:0] count2;
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            above1      <= 1'b0;
+            have_edge1  <= 1'b0;
+            count1      <= 32'd0;
+            freq1_hz    <= 32'd0;
+            freq1_valid <= 1'b0;
+
+            above2      <= 1'b0;
+            have_edge2  <= 1'b0;
+            count2      <= 32'd0;
+            freq2_hz    <= 32'd0;
+            freq2_valid <= 1'b0;
+        end
+        else begin
+            freq1_valid <= 1'b0;
+            freq2_valid <= 1'b0;
+
+            // =================================================
+            // CH1
+            // =================================================
+            if (adc_valid && (adc_ch == 1'b0)) begin
+
+                if (!above1 && (adc_data >= LEVEL_HIGH)) begin
+                    above1 <= 1'b1;
+
+                    if (!have_edge1) begin
+                        have_edge1 <= 1'b1;
+                        count1 <= 32'd0;
+                    end
+                    else begin
+                        if (count1 != 0) begin
+                            freq1_hz <= SAMPLE_RATE / (count1 + 1'b1);
+                            freq1_valid <= 1'b1;
+                        end
+                        count1 <= 32'd0;
+                    end
+                end
+                else if (above1 && (adc_data <= LEVEL_LOW)) begin
+                    above1 <= 1'b0;
+                end
+                else if (have_edge1) begin
+                    if (count1 != 32'hFFFFFFFF)
+                        count1 <= count1 + 1'b1;
+                end
+            end
+
+            // =================================================
+            // CH2
+            // =================================================
+            else if (adc_valid && (adc_ch == 1'b1)) begin
+
+                if (!above2 && (adc_data >= LEVEL_HIGH)) begin
+                    above2 <= 1'b1;
+
+                    if (!have_edge2) begin
+                        have_edge2 <= 1'b1;
+                        count2 <= 32'd0;
+                    end
+                    else begin
+                        if (count2 != 0) begin
+                            freq2_hz <= SAMPLE_RATE / (count2 + 1'b1);
+                            freq2_valid <= 1'b1;
+                        end
+                        count2 <= 32'd0;
+                    end
+                end
+                else if (above2 && (adc_data <= LEVEL_LOW)) begin
+                    above2 <= 1'b0;
+                end
+                else if (have_edge2) begin
+                    if (count2 != 32'hFFFFFFFF)
+                        count2 <= count2 + 1'b1;
+                end
+            end
+        end
+    end
+
+endmodule

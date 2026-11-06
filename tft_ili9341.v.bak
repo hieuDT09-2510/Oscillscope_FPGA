@@ -1,0 +1,721 @@
+module tft_ili9341 (
+    input  wire        clk,
+    input  wire        rst_n,
+
+    // ---------------------------------------------------------
+    // Pixel interface
+    // ---------------------------------------------------------
+    input  wire        pixel_req,
+    input  wire [8:0]  pixel_x,       // 0..239
+    input  wire [8:0]  pixel_y,       // 0..319
+    input  wire [15:0] pixel_color,   // RGB565
+
+    output reg         pixel_busy,
+    output reg         pixel_done,
+
+    output reg         ready,
+
+    // ---------------------------------------------------------
+    // TFT pins
+    // ---------------------------------------------------------
+    output reg         TFT_CS,
+    output reg         TFT_DC,
+    output reg         TFT_RST,
+    output reg         TFT_SCK,
+    output reg         TFT_MOSI
+);
+
+    // =========================================================
+    // SPI
+    //
+    // 50 MHz / (2 * 6) ≈ 4.17 MHz
+    // =========================================================
+
+    parameter SPI_DIV = 6;
+
+    reg [3:0]  spi_bit;
+    reg [7:0]  spi_shift;
+    reg [3:0]  spi_div;
+
+    reg        spi_busy;
+    reg        spi_done;
+    reg        spi_start;
+
+    // =========================================================
+    // Command FSM
+    // =========================================================
+
+    localparam S_RESET       = 6'd0;
+    localparam S_RESET_WAIT  = 6'd1;
+    localparam S_SWRESET     = 6'd2;
+    localparam S_SWRESET_W   = 6'd3;
+
+    localparam S_SLEEP_OUT   = 6'd4;
+    localparam S_SLEEP_W     = 6'd5;
+
+    localparam S_PIXEL_CMD   = 6'd6;
+    localparam S_PIXEL_DATA  = 6'd7;
+
+    localparam S_MADCTL_CMD  = 6'd8;
+    localparam S_MADCTL_DATA = 6'd9;
+
+    localparam S_COL_CMD     = 6'd10;
+    localparam S_COL_1       = 6'd11;
+    localparam S_COL_2       = 6'd12;
+    localparam S_COL_3       = 6'd13;
+    localparam S_COL_4       = 6'd14;
+
+    localparam S_PAGE_CMD    = 6'd15;
+    localparam S_PAGE_1      = 6'd16;
+    localparam S_PAGE_2      = 6'd17;
+    localparam S_PAGE_3      = 6'd18;
+    localparam S_PAGE_4      = 6'd19;
+
+    localparam S_RAMWR       = 6'd20;
+    localparam S_COLOR_H     = 6'd21;
+    localparam S_COLOR_L     = 6'd22;
+
+    localparam S_DISP_ON     = 6'd23;
+    localparam S_DISP_WAIT   = 6'd24;
+
+    localparam S_READY       = 6'd25;
+
+    reg [5:0] state;
+
+    reg [31:0] delay_cnt;
+
+    reg [8:0]  x_reg;
+    reg [8:0]  y_reg;
+    reg [15:0] color_reg;
+
+
+    // =========================================================
+    // SPI transmitter
+    // SPI MODE 0
+    // =========================================================
+
+    always @(posedge clk or negedge rst_n) begin
+
+        if (!rst_n) begin
+
+            TFT_SCK  <= 1'b0;
+            TFT_MOSI <= 1'b0;
+
+            spi_bit  <= 4'd0;
+            spi_shift <= 8'd0;
+            spi_div  <= 4'd0;
+
+            spi_busy <= 1'b0;
+            spi_done <= 1'b0;
+
+        end
+
+        else begin
+
+            spi_done <= 1'b0;
+
+            // -------------------------------------------------
+            // Start transmission
+            // -------------------------------------------------
+
+            if (spi_start && !spi_busy) begin
+
+                spi_shift <= spi_shift;
+
+                spi_bit <= 4'd7;
+
+                spi_div <= 4'd0;
+
+                spi_busy <= 1'b1;
+
+                TFT_SCK <= 1'b0;
+
+                TFT_MOSI <= spi_shift[7];
+
+            end
+
+            // -------------------------------------------------
+            // SPI running
+            // -------------------------------------------------
+
+            else if (spi_busy) begin
+
+                if (spi_div == SPI_DIV - 1) begin
+
+                    spi_div <= 4'd0;
+
+                    // Rising edge
+                    if (TFT_SCK == 1'b0) begin
+
+                        TFT_SCK <= 1'b1;
+
+                    end
+
+                    // Falling edge
+                    else begin
+
+                        TFT_SCK <= 1'b0;
+
+                        if (spi_bit == 0) begin
+
+                            spi_busy <= 1'b0;
+
+                            spi_done <= 1'b1;
+
+                            TFT_MOSI <= 1'b0;
+
+                        end
+
+                        else begin
+
+                            spi_bit <= spi_bit - 1'b1;
+
+                            TFT_MOSI <= spi_shift[spi_bit - 1'b1];
+
+                        end
+
+                    end
+
+                end
+
+                else begin
+
+                    spi_div <= spi_div + 1'b1;
+
+                end
+
+            end
+
+        end
+
+    end
+
+
+    // =========================================================
+    // Main FSM
+    // =========================================================
+
+    always @(posedge clk or negedge rst_n) begin
+
+        if (!rst_n) begin
+
+            state <= S_RESET;
+
+            TFT_CS  <= 1'b1;
+            TFT_DC  <= 1'b1;
+            TFT_RST <= 1'b0;
+
+            ready       <= 1'b0;
+            pixel_busy  <= 1'b0;
+            pixel_done  <= 1'b0;
+
+            delay_cnt <= 32'd0;
+
+            x_reg <= 9'd0;
+            y_reg <= 9'd0;
+            color_reg <= 16'h0000;
+
+            spi_start <= 1'b0;
+            spi_shift <= 8'h00;
+
+        end
+
+        else begin
+
+            spi_start  <= 1'b0;
+            pixel_done <= 1'b0;
+
+            case (state)
+
+                // =================================================
+                // Hardware reset
+                // =================================================
+
+                S_RESET: begin
+
+                    TFT_CS  <= 1'b1;
+                    TFT_RST <= 1'b0;
+
+                    if (delay_cnt < 5_000_000) begin
+                        delay_cnt <= delay_cnt + 1'b1;
+                    end
+
+                    else begin
+
+                        delay_cnt <= 0;
+
+                        TFT_RST <= 1'b1;
+
+                        state <= S_RESET_WAIT;
+
+                    end
+
+                end
+
+
+                // =================================================
+                // Wait after reset
+                // =================================================
+
+                S_RESET_WAIT: begin
+
+                    if (delay_cnt < 5_000_000) begin
+
+                        delay_cnt <= delay_cnt + 1'b1;
+
+                    end
+
+                    else begin
+
+                        delay_cnt <= 0;
+
+                        TFT_CS <= 1'b0;
+
+                        TFT_DC <= 1'b0;
+
+                        spi_shift <= 8'h01;
+
+                        spi_start <= 1'b1;
+
+                        state <= S_SWRESET;
+
+                    end
+
+                end
+
+
+                // =================================================
+                // Software reset
+                // =================================================
+
+                S_SWRESET: begin
+
+                    if (spi_done) begin
+
+                        delay_cnt <= 0;
+
+                        state <= S_SWRESET_W;
+
+                    end
+
+                end
+
+
+                S_SWRESET_W: begin
+
+                    if (delay_cnt < 2_000_000) begin
+
+                        delay_cnt <= delay_cnt + 1'b1;
+
+                    end
+
+                    else begin
+
+                        delay_cnt <= 0;
+
+                        TFT_DC <= 1'b0;
+
+                        spi_shift <= 8'h11;
+
+                        spi_start <= 1'b1;
+
+                        state <= S_SLEEP_OUT;
+
+                    end
+
+                end
+
+
+                // =================================================
+                // Sleep out
+                // =================================================
+
+                S_SLEEP_OUT: begin
+
+                    if (spi_done) begin
+
+                        delay_cnt <= 0;
+
+                        state <= S_SLEEP_W;
+
+                    end
+
+                end
+
+
+                S_SLEEP_W: begin
+
+                    if (delay_cnt < 2_000_000) begin
+
+                        delay_cnt <= delay_cnt + 1'b1;
+
+                    end
+
+                    else begin
+
+                        delay_cnt <= 0;
+
+                        // Pixel format command
+                        TFT_DC <= 1'b0;
+
+                        spi_shift <= 8'h3A;
+
+                        spi_start <= 1'b1;
+
+                        state <= S_PIXEL_CMD;
+
+                    end
+
+                end
+
+
+                // =================================================
+                // Pixel format
+                // 16-bit RGB565
+                // =================================================
+
+                S_PIXEL_CMD: begin
+
+                    if (spi_done) begin
+
+                        TFT_DC <= 1'b1;
+
+                        spi_shift <= 8'h55;
+
+                        spi_start <= 1'b1;
+
+                        state <= S_PIXEL_DATA;
+
+                    end
+
+                end
+
+
+                S_PIXEL_DATA: begin
+
+                    if (spi_done) begin
+
+                        TFT_DC <= 1'b0;
+
+                        spi_shift <= 8'h36;
+
+                        spi_start <= 1'b1;
+
+                        state <= S_MADCTL_CMD;
+
+                    end
+
+                end
+
+
+                // =================================================
+                // MADCTL
+                // Landscape
+                // =================================================
+
+                S_MADCTL_CMD: begin
+
+                    if (spi_done) begin
+
+                        TFT_DC <= 1'b1;
+
+                        spi_shift <= 8'h48;
+
+                        spi_start <= 1'b1;
+
+                        state <= S_MADCTL_DATA;
+
+                    end
+
+                end
+
+
+                S_MADCTL_DATA: begin
+
+                    if (spi_done) begin
+
+                        state <= S_READY;
+
+                    end
+
+                end
+
+
+                // =================================================
+                // Ready
+                // =================================================
+
+                S_READY: begin
+
+                    ready <= 1'b1;
+
+                    TFT_CS <= 1'b1;
+
+                    pixel_busy <= 1'b0;
+
+                    // -------------------------------------------------
+                    // Nhận yêu cầu vẽ pixel
+                    // -------------------------------------------------
+
+                    if (pixel_req) begin
+
+                        pixel_busy <= 1'b1;
+
+                        x_reg <= pixel_x;
+                        y_reg <= pixel_y;
+                        color_reg <= pixel_color;
+
+                        TFT_CS <= 1'b0;
+
+                        // Column address
+                        TFT_DC <= 1'b0;
+
+                        spi_shift <= 8'h2A;
+
+                        spi_start <= 1'b1;
+
+                        state <= S_COL_CMD;
+
+                    end
+
+                end
+
+
+                // =================================================
+                // CASET
+                // =================================================
+
+                S_COL_CMD: begin
+
+                    if (spi_done) begin
+
+                        TFT_DC <= 1'b1;
+
+                        spi_shift <= {1'b1, x_reg[8:2]};
+
+                        // Correct byte will be overwritten below
+                        spi_shift <= 8'h00;
+
+                        spi_start <= 1'b1;
+
+                        state <= S_COL_1;
+
+                    end
+
+                end
+
+
+                S_COL_1: begin
+
+                    if (spi_done) begin
+
+                        TFT_DC <= 1'b1;
+
+                        spi_shift <= x_reg[7:0];
+
+                        spi_start <= 1'b1;
+
+                        state <= S_COL_2;
+
+                    end
+
+                end
+
+
+                S_COL_2: begin
+
+                    if (spi_done) begin
+
+                        spi_shift <= 8'h00;
+
+                        spi_start <= 1'b1;
+
+                        state <= S_COL_3;
+
+                    end
+
+                end
+
+
+                S_COL_3: begin
+
+                    if (spi_done) begin
+
+                        spi_shift <= x_reg[7:0];
+
+                        spi_start <= 1'b1;
+
+                        state <= S_COL_4;
+
+                    end
+
+                end
+
+
+                S_COL_4: begin
+
+                    if (spi_done) begin
+
+                        // PAGE SET
+                        TFT_DC <= 1'b0;
+
+                        spi_shift <= 8'h2B;
+
+                        spi_start <= 1'b1;
+
+                        state <= S_PAGE_CMD;
+
+                    end
+
+                end
+
+
+                // =================================================
+                // PASET
+                // =================================================
+
+                S_PAGE_CMD: begin
+
+                    if (spi_done) begin
+
+                        TFT_DC <= 1'b1;
+
+                        spi_shift <= 8'h00;
+
+                        spi_start <= 1'b1;
+
+                        state <= S_PAGE_1;
+
+                    end
+
+                end
+
+
+                S_PAGE_1: begin
+
+                    if (spi_done) begin
+
+                        spi_shift <= y_reg[7:0];
+
+                        spi_start <= 1'b1;
+
+                        state <= S_PAGE_2;
+
+                    end
+
+                end
+
+
+                S_PAGE_2: begin
+
+                    if (spi_done) begin
+
+                        spi_shift <= 8'h00;
+
+                        spi_start <= 1'b1;
+
+                        state <= S_PAGE_3;
+
+                    end
+
+                end
+
+
+                S_PAGE_3: begin
+
+                    if (spi_done) begin
+
+                        spi_shift <= y_reg[7:0];
+
+                        spi_start <= 1'b1;
+
+                        state <= S_PAGE_4;
+
+                    end
+
+                end
+
+
+                S_PAGE_4: begin
+
+                    if (spi_done) begin
+
+                        TFT_DC <= 1'b0;
+
+                        spi_shift <= 8'h2C;
+
+                        spi_start <= 1'b1;
+
+                        state <= S_RAMWR;
+
+                    end
+
+                end
+
+
+                // =================================================
+                // RAMWR
+                // =================================================
+
+                S_RAMWR: begin
+
+                    if (spi_done) begin
+
+                        TFT_DC <= 1'b1;
+
+                        spi_shift <= color_reg[15:8];
+
+                        spi_start <= 1'b1;
+
+                        state <= S_COLOR_H;
+
+                    end
+
+                end
+
+
+                S_COLOR_H: begin
+
+                    if (spi_done) begin
+
+                        spi_shift <= color_reg[7:0];
+
+                        spi_start <= 1'b1;
+
+                        state <= S_COLOR_L;
+
+                    end
+
+                end
+
+
+                S_COLOR_L: begin
+
+                    if (spi_done) begin
+
+                        TFT_CS <= 1'b1;
+
+                        pixel_busy <= 1'b0;
+
+                        pixel_done <= 1'b1;
+
+                        state <= S_READY;
+
+                    end
+
+                end
+
+
+                default: begin
+
+                    state <= S_RESET;
+
+                end
+
+            endcase
+
+        end
+
+    end
+
+endmodule
